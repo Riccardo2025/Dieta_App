@@ -3,7 +3,7 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import google.generativeai as genai
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 
 # ==========================================
@@ -102,19 +102,34 @@ def login_page():
             btn = st.form_submit_button("Entra come Studio")
             
             if btn:
-                df = leggi_tab("CONFIG_STUDI")
-                # Pulizia dati (strip spazi vuoti)
-                df['username'] = df['username'].astype(str).str.strip()
-                df['password'] = df['password'].astype(str).str.strip()
+    df = leggi_tab("CONFIG_STUDI")
+    # ... pulizia dati ...
+    check = df[(df['username'] == user) & (df['password'] == pwd)]
+    
+    if not check.empty:
+        dati_utente = check.iloc[0]
+        
+        # --- LOGICA 3 GIORNI ---
+        data_iscrizione_str = str(dati_utente['data_iscrizione'])
+        pagato = str(dati_utente['pagato']).upper().strip()
+        
+        try:
+            data_inizio = datetime.strptime(data_iscrizione_str, "%Y-%m-%d")
+            oggi = datetime.now()
+            giorni_passati = (oggi - data_inizio).days
+            
+            # SE sono passati più di 3 giorni E non ha pagato -> BLOCCA
+            if giorni_passati > 3 and pagato != "SI":
+                st.error(f"⛔ Periodo di prova scaduto da {giorni_passati - 3} giorni.")
+                st.warning("Per continuare a usare il servizio, contatta l'amministratore per il pagamento.")
+                st.stop() # Ferma tutto qui
                 
-                check = df[(df['username'] == user) & (df['password'] == pwd)]
-                if not check.empty:
-                    st.session_state.logged_in = True
-                    st.session_state.role = "studio"
-                    st.session_state.user_data = check.iloc[0]
-                    st.rerun()
-                else:
-                    st.error("Credenziali errate.")
+        except ValueError:
+            # Se la data è scritta male nel foglio, lascialo entrare ma avvisami
+            st.warning("Errore data iscrizione. Contattare supporto.")
+
+        # Se tutto ok, procedi col login normale
+        st.session_state.logged_in = True
 
     # --- LOGIN CLIENTE ---
     with tab2:
@@ -325,4 +340,5 @@ else:
     if st.session_state.role == "studio":
         dashboard_studio()
     elif st.session_state.role == "cliente":
+
         dashboard_cliente()

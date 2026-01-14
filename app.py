@@ -403,51 +403,130 @@ def dashboard_studio():
                     else:
                         st.button("No Email inserita", disabled=True, use_container_width=True)
 
-    # TAB 2: NUOVO CLIENTE (Aggiornato con Email/Tel)
+    # TAB 2: GESTIONE CLIENTI (Visualizzazione + Creazione)
     with tabs[1]:
-        with st.form("new_client"):
-            st.write("### Aggiungi Nuovo Paziente")
-            c1, c2 = st.columns(2)
-            with c1:
-                nc_user = st.text_input("Username (univoco)")
-                nc_pass = st.text_input("Password")
-                nc_nome = st.text_input("Nome Completo")
-            with c2:
-                nc_email = st.text_input("Email")
-                nc_tel = st.text_input("Telefono (es. 39333...)")
-                nc_dati = st.text_input("Dati Fisici")
+        st.subheader("👥 I Tuoi Pazienti")
+        
+        # 1. VISUALIZZAZIONE LISTA
+        df_c = leggi_tab("CLIENTI")
+        # Filtra solo i clienti di questo studio
+        miei_pazienti = df_c[df_c['studio_riferimento'] == dati['username']]
+        
+        if not miei_pazienti.empty:
+            # Selezioniamo solo le colonne utili da mostrare (nascondiamo password e studio)
+            colonne_visibili = ['username', 'nome_completo', 'email', 'telefono', 'dati_fisici', 'obiettivo_specifico']
+            # Filtriamo per essere sicuri che le colonne esistano (in caso di vecchie versioni del foglio)
+            cols_reali = [c for c in colonne_visibili if c in miei_pazienti.columns]
             
-            nc_obiett = st.text_input("Obiettivo Specifico")
-            
-            if st.form_submit_button("Crea Paziente"):
-                df_c = leggi_tab("CLIENTI")
-                if nc_user in df_c['username'].values:
-                    st.error("Username già esistente.")
-                else:
-                    new_row = pd.DataFrame([{
-                        "username": nc_user,
-                        "password": nc_pass,
-                        "nome_completo": nc_nome,
-                        "studio_riferimento": dati['username'],
-                        "dati_fisici": nc_dati,
-                        "obiettivo_specifico": nc_obiett,
-                        "email": nc_email,
-                        "telefono": nc_tel
-                    }])
-                    # Salvataggio usando la funzione sicura scrivi_tab
-                    # Nota: scrivi_tab vuole il dataframe completo o fa append. 
-                    # Qui usiamo la logica di append manuale se usi la funzione scrivi_tab modificata prima
-                    # Se hai mantenuto la funzione scrivi_tab che fa append da sola, passa solo new_row.
-                    # Per sicurezza passiamo tutto:
-                    scrivi_tab("CLIENTI", pd.concat([df_c, new_row], ignore_index=True))
-                    st.success("Cliente creato!")
-                    time.sleep(1)
-                    st.rerun()
+            # Mostra la tabella
+            st.dataframe(
+                miei_pazienti[cols_reali], 
+                use_container_width=True, 
+                hide_index=True
+            )
+            st.caption(f"Totale pazienti: {len(miei_pazienti)}")
+        else:
+            st.info("Non hai ancora inserito nessun paziente.")
 
-    # TAB 3: SETTINGS
+        st.write("---")
+
+        # 2. CREAZIONE NUOVO (Dentro un expander per pulizia)
+        with st.expander("➕ AGGIUNGI NUOVO PAZIENTE", expanded=False):
+            with st.form("new_client"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    nc_user = st.text_input("Username (univoco per login)")
+                    nc_pass = st.text_input("Password (per il paziente)")
+                    nc_nome = st.text_input("Nome e Cognome")
+                with c2:
+                    nc_email = st.text_input("Email")
+                    nc_tel = st.text_input("Telefono (es. 39333...)")
+                    nc_dati = st.text_input("Dati Fisici (es. 80kg, 180cm)")
+                
+                nc_obiett = st.text_input("Obiettivo Specifico")
+                
+                if st.form_submit_button("Salva Nuovo Paziente"):
+                    # Rileggiamo il DF per essere sicuri di avere l'ultima versione
+                    df_c_fresh = leggi_tab("CLIENTI")
+                    
+                    if nc_user in df_c_fresh['username'].values:
+                        st.error("⚠️ Username già esistente! Scegline un altro.")
+                    else:
+                        new_row = pd.DataFrame([{
+                            "username": nc_user,
+                            "password": nc_pass,
+                            "nome_completo": nc_nome,
+                            "studio_riferimento": dati['username'],
+                            "dati_fisici": nc_dati,
+                            "obiettivo_specifico": nc_obiett,
+                            "email": nc_email,
+                            "telefono": nc_tel
+                        }])
+                        
+                        # Usiamo concat + scrivi_tab
+                        df_updated = pd.concat([df_c_fresh, new_row], ignore_index=True)
+                        
+                        if scrivi_tab("CLIENTI", df_updated):
+                            st.success(f"✅ Paziente {nc_nome} creato con successo!")
+                            time.sleep(1)
+                            st.rerun() # Ricarica la pagina per vederlo subito in tabella
+
+# TAB 3: SETTINGS (Impostazioni Studio)
     with tabs[2]:
-         # ... (Lascia uguale a prima) ...
-         pass
+        st.header("⚙️ Personalizza il tuo Studio")
+        st.write("Qui puoi modificare il logo che vedono i clienti e istruire l'IA sul tuo metodo di lavoro.")
+
+        with st.form("settings_form"):
+            # Recuperiamo i valori attuali gestendo eventuali "nan" (vuoti)
+            current_logo = str(dati.get('logo_url', ''))
+            if current_logo == "nan": current_logo = ""
+
+            current_style = str(dati.get('stile_guida', ''))
+            if current_style == "nan": current_style = ""
+
+            # Campi di input
+            new_logo = st.text_input("URL Logo (Link immagine)", value=current_logo)
+            st.caption("Incolla un link diretto a un'immagine (es. da imgur o dal tuo sito web).")
+
+            new_style = st.text_area("Stile Guida Nutrizionale (Prompt IA)", value=current_style, height=200)
+            st.caption("Istruisci l'IA: es. 'Prediligi dieta mediterranea', 'Usa tono severo', 'Escludi integratori'.")
+            
+            # Pulsante di salvataggio
+            if st.form_submit_button("💾 Aggiorna Impostazioni"):
+                try:
+                    # 1. Leggiamo tutto il foglio CONFIG_STUDI
+                    df_studi = leggi_tab("CONFIG_STUDI")
+                    
+                    # 2. Cerchiamo la riga del tuo studio
+                    # Puliamo le stringhe per sicurezza
+                    df_studi['username'] = df_studi['username'].astype(str).str.strip()
+                    target_user = str(dati['username']).strip()
+                    
+                    if target_user in df_studi['username'].values:
+                        # Troviamo l'indice della riga
+                        idx = df_studi.index[df_studi['username'] == target_user].tolist()[0]
+                        
+                        # 3. Aggiorniamo i valori in memoria
+                        df_studi.at[idx, 'logo_url'] = new_logo
+                        df_studi.at[idx, 'stile_guida'] = new_style
+                        
+                        # 4. Salvataggio su Google Sheets
+                        # NOTA: Qui usiamo conn.update perché stiamo MODIFICANDO, non aggiungendo
+                        conn.update(worksheet="CONFIG_STUDI", data=df_studi)
+                        st.cache_data.clear()
+                        
+                        # 5. Aggiorniamo la sessione locale (per vedere le modifiche subito)
+                        st.session_state.user_data['logo_url'] = new_logo
+                        st.session_state.user_data['stile_guida'] = new_style
+                        
+                        st.success("✅ Impostazioni aggiornate con successo!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("Errore critico: Impossibile trovare il tuo utente nel database per aggiornarlo.")
+                        
+                except Exception as e:
+                    st.error(f"Errore durante il salvataggio: {e}")
 
 # ==========================================
 # DASHBOARD CLIENTE
@@ -487,3 +566,4 @@ else:
         dashboard_studio()
     elif st.session_state.role == "cliente":
         dashboard_cliente()
+

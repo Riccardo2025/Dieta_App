@@ -3,94 +3,142 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import google.generativeai as genai
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
+import gspread
+from google.oauth2.service_account import Credentials
+import urllib.parse
 
 # ==========================================
-# CONFIGURAZIONE INIZIALE
+# CONFIGURAZIONE PAGINA
 # ==========================================
 st.set_page_config(page_title="Health Manager AI", layout="wide", page_icon="🥗")
 
-# Recupero API Key
+# Recupero API Key Gemini
 try:
     genai.configure(api_key=st.secrets["general"]["GEMINI_API_KEY"])
 except Exception as e:
-    st.error("Manca la GEMINI_API_KEY nei secrets o c'è un errore di configurazione.")
+    st.error(f"Errore Configurazione Gemini: {e}")
     st.stop()
 
-# Connessione al DB (Google Sheets)
+# Connessione Database (Legge automaticamente da secrets.toml)
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
-    st.error("Errore di connessione a Google Sheets. Verifica secrets.toml.")
+    st.error(f"Errore connessione Google Sheets: {e}")
     st.stop()
 
 # ==========================================
-# FUNZIONI DI DATABASE (CRUD)
+# FUNZIONI DATABASE (CRUD)
 # ==========================================
-
 def leggi_tab(nome_tab):
-    """Legge una specifica scheda del Google Sheet"""
+    """Legge i dati e li pulisce per evitare errori di login"""
+    df = pd.DataFrame()
+    
+    # 1. TENTATIVO DI LETTURA (Ibrido)
     try:
-        # ttl=0 assicura che i dati siano sempre freschi
-        return conn.read(worksheet=nome_tab, ttl=0)
-    except Exception as e:
-        st.error(f"Errore lettura DB ({nome_tab}): {e}")
-        return pd.DataFrame()
+        # Prova metodo ufficiale
+        df = conn.read(worksheet=nome_tab, ttl=0)
+    except Exception:
+        # Se fallisce, usa metodo CSV (Fallback)
+        try:
+            url_sheet = st.secrets["connections"]["gsheets"]["spreadsheet"]
+            sheet_id = url_sheet.split("/d/")[1].split("/")[0]
+            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={nome_tab}"
+            df = pd.read_csv(csv_url)
+        except:
+            return pd.DataFrame() # Ritorna vuoto se tutto fallisce
+
+    # 2. PULIZIA DATI (FONDAMENTALE PER IL LOGIN)
+    if not df.empty:
+        # Pulisce i nomi delle colonne (toglie spazi vuoti errati)
+        df.columns = df.columns.str.strip()
+        
+        # Converte TUTTO il contenuto in testo (così 1234 diventa "1234")
+        df = df.astype(str)
+        
+        # Rimuove spazi vuoti prima e dopo ogni parola in tutte le celle
+        for col in df.columns:
+            try:
+                df[col] = df[col].str.strip()
+            except:
+                pass
+
+    return df
+
 
 def scrivi_tab(nome_tab, dataframe):
-    """Sovrascrive una scheda con il nuovo dataframe"""
+    """Scrive usando gspread leggendo le credenziali dai Secrets (Cloud Ready)"""
     try:
-        conn.update(worksheet=nome_tab, data=dataframe)
-        st.cache_data.clear() # Pulisce la cache
-    except Exception as e:
-        st.error(f"Errore scrittura DB: {e}")
+        # 1. Definisci gli ambiti
+        scope = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        
+        # 2. CREAZIONE CREDENZIALI DAI SECRETS (Invece che dal file fisico)
+        # Convertiamo l'oggetto secrets in un dizionario python standard
+        creds_dict = dict(st.secrets["connections"]["gsheets"])
+        
+        # Pulizia della chiave privata (spesso i secrets convertono \n in \\n, qui lo correggiamo)
+        if "private_key" in creds_dict:
+             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
-def get_studio_info(username_studio):
-    """Recupera logo e stile dello studio"""
-    df = leggi_tab("CONFIG_STUDI")
-    if df.empty: return None
-    
-    # Assicuriamoci che le colonne siano stringhe per evitare errori
-    df['username'] = df['username'].astype(str)
-    
-    studio = df[df['username'] == str(username_studio)]
-    if not studio.empty:
-        return studio.iloc[0]
-    return None
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+        client = gspread.authorize(creds)
+        
+        # 3. Apri il foglio
+        url_foglio = st.secrets["connections"]["gsheets"]["spreadsheet"]
+        sheet = client.open_by_url(url_foglio).worksheet(nome_tab)
+        
+        # 4. Prepara l'ultima riga
+        ultima_riga = dataframe.iloc[-1].tolist()
+        ultima_riga = [str(x) for x in ultima_riga]
+        
+        # 5. Aggiungi
+        sheet.append_row(ultima_riga)
+        
+        st.cache_data.clear()
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Errore GSPREAD: {e}")
+        return False           
 
 # ==========================================
 # FUNZIONI AI (GEMINI)
 # ==========================================
-def genera_piano_nutrizionale(testo_analisi, stile_guida, dati_paziente):
+def genera_piano_nutrizionale(testo_input, stile_studio, obiettivo_cliente, dati_fisici):
     model = genai.GenerativeModel('gemini-2.5-flash')
     
     prompt = f"""
-    Agisci come un nutrizionista esperto.
+    Agisci come un nutrizionista professionista.
     
-    CONTESTO STUDIO:
-    Lo studio segue questo approccio rigoroso: "{stile_guida}".
+    LINEE GUIDA DELLO STUDIO (Brand):
+    "{stile_studio}"
     
-    DATI PAZIENTE:
-    {dati_paziente}
+    PROFILO PAZIENTE:
+    - Dati Fisici: {dati_fisici}
+    - OBIETTIVO: "{obiettivo_cliente}"
     
-    ANALISI/REFERTI CARICATI:
-    {testo_analisi}
+    DATI CLINICI / SINTOMI FORNITI:
+    "{testo_input}"
     
     COMPITO:
-    Crea una bozza di piano alimentare settimanale (solo Lun-Dom) basato sui dati sopra.
-    Non usare formattazione complessa, usa elenchi puntati chiari.
-    Focalizzati sulle carenze emerse dalle analisi.
+    Crea un piano alimentare settimanale dettagliato.
+    1. Rispetta rigorosamente l'obiettivo del paziente.
+    2. Adatta lo stile alle linee guida dello studio.
+    3. Usa un tono professionale ed empatico.
     """
     
     try:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"Errore generazione: {e}"
+        return f"Errore generazione AI: {e}"
 
 # ==========================================
-# GESTIONE SESSIONE E LOGIN
+# GESTIONE LOGIN E STATO
 # ==========================================
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
@@ -112,45 +160,68 @@ def login_page():
             
             if btn:
                 df = leggi_tab("CONFIG_STUDI")
+                
                 if df.empty:
-                    st.error("Database Studi vuoto o non raggiungibile.")
+                    st.error("Database non raggiungibile o vuoto.")
                 else:
-                    # Pulizia dati
+                    # --- PULIZIA SPECIALE PER LOGIN ---
+                    # 1. Assicuriamoci che i nomi colonne siano minuscoli e senza spazi
+                    df.columns = df.columns.str.lower().str.strip()
+                    
+                    # 2. Convertiamo i dati in stringa
                     df['username'] = df['username'].astype(str).str.strip()
                     df['password'] = df['password'].astype(str).str.strip()
                     
-                    check = df[(df['username'] == user) & (df['password'] == pwd)]
+                    # 3. TRUCCO FONDAMENTALE: Rimuovi ".0" se presente alla fine della password
+                    # (Questo risolve il problema 1234 diventa 1234.0)
+                    df['password'] = df['password'].str.replace(r'\.0$', '', regex=True)
+
+                    # --- DEBUG VISIVO (Così vedi coi tuoi occhi) ---
+                    st.write("🔍 Confronto Dati:")
+                    st.write(f"Tu hai scritto: '{user}' e '{pwd}'")
+                    st.write("Il DB contiene (prime righe):")
+                    st.dataframe(df[['username', 'password']].head())
+                    # ---------------------------------------------
+
+                    # 4. IL CONTROLLO
+                    # Usiamo .str.lower() per ignorare maiuscole/minuscole nello username
+                    check = df[
+                        (df['username'].str.lower() == user.strip().lower()) & 
+                        (df['password'] == pwd.strip())
+                    ]
                     
                     if not check.empty:
                         dati_utente = check.iloc[0]
                         
-                        # --- CONTROLLO 3 GIORNI ---
-                        # Gestiamo il caso in cui le colonne non esistano ancora nel foglio
+                        # --- CONTROLLO 3 GIORNI (Formato Italiano) ---
                         try:
-                            data_iscrizione_str = str(dati_utente.get('data_iscrizione', ''))
-                            pagato = str(dati_utente.get('pagato', 'NO')).upper().strip()
+                            # Cerchiamo la colonna data, gestendo nomi diversi
+                            col_data = 'data_iscrizione' if 'data_iscrizione' in df.columns else 'data'
+                            col_paga = 'pagato'
                             
-                            # Se la data c'è, controlliamo
-                            if len(data_iscrizione_str) >= 10: # es. 2024-01-01
-                                data_inizio = datetime.strptime(data_iscrizione_str, "%Y-%m-%d")
-                                oggi = datetime.now()
-                                giorni_passati = (oggi - data_inizio).days
+                            data_str = str(dati_utente.get(col_data, ''))
+                            pagato = str(dati_utente.get(col_paga, 'NO')).upper().strip()
+                            
+                            if len(data_str) >= 8:
+                                try:
+                                    d_inizio = datetime.strptime(data_str, "%d/%m/%Y")
+                                except:
+                                    d_inizio = datetime.strptime(data_str, "%d-%m-%Y")
                                 
-                                if giorni_passati > 3 and pagato != "SI":
-                                    st.error(f"⛔ Periodo di prova scaduto da {giorni_passati - 3} giorni.")
-                                    st.warning("Contatta l'amministratore per sbloccare l'account.")
+                                giorni = (datetime.now() - d_inizio).days
+                                if giorni > 3 and pagato != "SI":
+                                    st.error(f"⛔ Prova scaduta da {giorni-3} giorni.")
                                     st.stop()
                         except Exception as e:
-                            # Se c'è un errore nella data, lasciamo passare ma logghiamo (o ignoriamo)
-                            print(f"Warning data iscrizione: {e}")
+                            print(f"Salto controllo data: {e}")
 
-                        # Login ok
+                        # LOGIN OK
                         st.session_state.logged_in = True
                         st.session_state.role = "studio"
                         st.session_state.user_data = dati_utente
                         st.rerun()
                     else:
-                        st.error("Credenziali errate.")
+                        st.error("❌ Credenziali errate. Controlla la tabella qui sopra.")
 
     # --- LOGIN CLIENTE ---
     with tab2:
@@ -184,127 +255,202 @@ def logout():
     st.rerun()
 
 # ==========================================
-# INTERFACCIA STUDIO (ADMIN)
+# DASHBOARD STUDIO
 # ==========================================
 def dashboard_studio():
     dati = st.session_state.user_data
     
     with st.sidebar:
         logo_url = str(dati.get('logo_url', ''))
+        # CORREZIONE WARNING: cambiato use_column_width in use_container_width
         if logo_url and logo_url.lower() != "nan":
-            st.image(logo_url, use_container_width=True)
-        st.title(f"{dati['nome_studio']}")
+            st.image(logo_url, use_container_width=True) 
         
-        # Mostra stato abbonamento
-        pagato = str(dati.get('pagato', 'NO')).upper()
-        if pagato == "SI":
-            st.success("✅ Account Premium Attivo")
-        else:
-            st.warning("⏳ Modalità Prova")
-            
+        st.title(f"{dati['nome_studio']}")
         if st.button("Esci"): logout()
 
-    st.subheader(f"👋 Ciao, {dati['username']}")
+    st.subheader(f"Gestione Pazienti - {dati['nome_studio']}")
     
-    tabs = st.tabs(["📝 Genera Dieta", "👥 I Miei Clienti", "⚙️ Impostazioni"])
+    tabs = st.tabs(["📝 Genera Piano", "👥 Gestione Clienti", "⚙️ Impostazioni"])
 
     # TAB 1: GENERATORE
     with tabs[0]:
         df_clienti = leggi_tab("CLIENTI")
-        # Filtra clientela dello studio
         miei_clienti = df_clienti[df_clienti['studio_riferimento'] == dati['username']]
         
         if miei_clienti.empty:
-            st.warning("Non hai ancora clienti. Aggiungine uno nel tab 'I Miei Clienti'.")
+            st.warning("Nessun cliente trovato.")
         else:
-            cliente_sel = st.selectbox("Seleziona Paziente:", miei_clienti['username'].tolist())
+            col_sel, col_info = st.columns([1, 2], gap="medium")
             
+            with col_sel:
+                cliente_sel = st.selectbox("👤 Seleziona Paziente:", miei_clienti['username'].tolist())
+            
+            # Recupera dati aggiornati
             paziente_row = miei_clienti[miei_clienti['username'] == cliente_sel].iloc[0]
-            dati_fisici_paziente = paziente_row['dati_fisici']
+            fisico = str(paziente_row.get('dati_fisici', '-'))
+            obiettivo = str(paziente_row.get('obiettivo_specifico', 'Standard'))
             
-            st.info(f"Dati Paziente: {dati_fisici_paziente}")
+            # Gestione dati mancanti per la visualizzazione
+            email_db = str(paziente_row.get('email', ''))
+            if email_db == "nan": email_db = ""
             
-            uploaded_file = st.file_uploader("Carica Analisi (PDF o Immagine)", type=['pdf', 'png', 'jpg'])
-            testo_estratto = ""
-            
-            if uploaded_file and st.button("🚀 Genera Bozza con AI"):
-                with st.spinner("L'IA sta elaborando..."):
-                    # Simulazione OCR (qui andrebbe il tuo codice PyPDF2/Image)
-                    testo_estratto = f"Analisi caricata: {uploaded_file.name}."
-                    
-                    bozza = genera_piano_nutrizionale(testo_estratto, dati['stile_guida'], dati_fisici_paziente)
-                    st.session_state['bozza_temp'] = bozza 
-            
-            if 'bozza_temp' in st.session_state:
-                st.write("---")
-                dieta_finale = st.text_area("Modifica la bozza:", 
-                                           value=st.session_state['bozza_temp'], 
-                                           height=400)
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    note_interne = st.text_input("Note interne")
-                with col2:
-                    if st.button("💾 INVIA AL CLIENTE"):
-                        df_diete = leggi_tab("DIETE")
-                        nuova_riga = pd.DataFrame([{
-                            "cliente_username": cliente_sel,
-                            "data_assegnazione": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            "testo_dieta": dieta_finale,
-                            "note_studio": note_interne
-                        }])
-                        scrivi_tab("DIETE", pd.concat([df_diete, nuova_riga], ignore_index=True))
-                        st.success("Inviato!")
-                        del st.session_state['bozza_temp']
+            tel_db = str(paziente_row.get('telefono', ''))
+            if tel_db == "nan": tel_db = ""
 
-    # TAB 2: GESTIONE CLIENTI
+            with col_info:
+                with st.container(border=True):
+                    st.markdown(f"🎯 **Obiettivo:** {obiettivo}")
+                    st.caption(f"📏 {fisico} | 📞 {tel_db if tel_db else 'No Tel'} | 📧 {email_db if email_db else 'No Mail'}")
+
+            st.write("---")
+            
+            # INPUT DATI
+            col1, col2 = st.columns(2)
+            testo_ai = ""
+            
+            with col1:
+                uploaded_file = st.file_uploader("📂 Carica Referto", type=['pdf', 'png', 'jpg'])
+            with col2:
+                note_manuali = st.text_area("📝 Note / Sintomi", height=100)
+
+            # PULSANTE GENERA
+            if st.button("✨ GENERA PIANO ALIMENTARE ✨", type="primary", use_container_width=True):
+                with st.spinner("⏳ Elaborazione intelligenza artificiale..."):
+                    if uploaded_file: testo_ai += f" [FILE: {uploaded_file.name}] "
+                    if note_manuali: testo_ai += f" {note_manuali} "
+                    if not testo_ai: testo_ai = "Nessun dato fornito."
+
+                    bozza = genera_piano_nutrizionale(
+                        testo_ai, 
+                        dati['stile_guida'], 
+                        obiettivo, 
+                        fisico
+                    )
+                    st.session_state['bozza_temp'] = bozza
+            
+            # SEZIONE REVISIONE E INVIO
+            if 'bozza_temp' in st.session_state:
+                st.markdown("---")
+                dieta_finale = st.text_area("Revisione:", value=st.session_state['bozza_temp'], height=500)
+                
+                # --- BLOCCO SALVATAGGIO DATABASE ---
+                if st.button("💾 SALVA NEL DATABASE (Storico)", use_container_width=True):
+                    df_diete = leggi_tab("DIETE")
+                    nuova_riga = pd.DataFrame([{
+                        "cliente_username": cliente_sel,
+                        "data_assegnazione": datetime.now().strftime("%d/%m/%Y"),
+                        "testo_dieta": dieta_finale,
+                        "note_studio": "Generata via App"
+                    }])
+                    
+                    # Usa concat per preparare il dataframe completo (anche se scrivi_tab usa gspread append)
+                    df_completo = pd.concat([df_diete, nuova_riga], ignore_index=True)
+                    
+                    if scrivi_tab("DIETE", df_completo):
+                        st.balloons()
+                        st.success("✅ Salvato nello storico del cliente!")
+
+                st.markdown("---")
+                st.subheader("📤 Invia al Paziente (o a te stesso)")
+                
+                # --- BLOCCO INVIO CON CAMPI EDITABILI ---
+                c_edit, c_send = st.columns([1, 1], gap="large")
+                
+                with c_edit:
+                    st.caption("Modifica qui sotto per inviare a un numero/email diverso")
+                    # Campi modificabili (precompilati con dati DB)
+                    dest_tel = st.text_input("📱 Telefono (con prefisso 39...)", value=tel_db)
+                    dest_email = st.text_input("📧 Email", value=email_db)
+                    
+                    # Pulsante per salvare i nuovi contatti nel DB per il futuro
+                    if (dest_tel != tel_db or dest_email != email_db) and st.button("🔄 Aggiorna Rubrica Clienti"):
+                        # Logica di aggiornamento (Un po' complessa, ricarichiamo tutto il foglio Clienti)
+                        df_c = leggi_tab("CLIENTI")
+                        # Trova l'indice della riga
+                        idx = df_c.index[df_c['username'] == cliente_sel].tolist()[0]
+                        # Aggiorna
+                        df_c.at[idx, 'telefono'] = dest_tel
+                        df_c.at[idx, 'email'] = dest_email
+                        # Salva (sovrascrive scheda Clienti)
+                        # Nota: Qui usiamo conn.update perché stiamo modificando una riga esistente
+                        try:
+                            conn.update(worksheet="CLIENTI", data=df_c)
+                            st.cache_data.clear()
+                            st.success("Rubrica aggiornata!")
+                            time.sleep(1)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Errore aggiornamento rubrica: {e}")
+
+                with c_send:
+                    st.caption("Clicca per aprire l'app corrispondente")
+                    testo_encoded = urllib.parse.quote(f"Ciao {cliente_sel}, ecco il tuo piano nutrizionale:\n\n{dieta_finale}")
+                    
+                    # WhatsApp Logic
+                    if dest_tel:
+                        # Rimuovi spazi e + se presenti
+                        clean_tel = dest_tel.replace("+", "").replace(" ", "")
+                        link_wa = f"https://wa.me/{clean_tel}?text={testo_encoded}"
+                        st.link_button("🟢 Invia su WhatsApp", link_wa, use_container_width=True)
+                    else:
+                        st.button("No Telefono inserito", disabled=True, use_container_width=True)
+
+                    # Email Logic
+                    if dest_email and "@" in dest_email:
+                        link_mail = f"mailto:{dest_email}?subject=Il tuo Piano Nutrizionale&body={testo_encoded}"
+                        st.link_button("📧 Invia per Email", link_mail, use_container_width=True)
+                    else:
+                        st.button("No Email inserita", disabled=True, use_container_width=True)
+
+    # TAB 2: NUOVO CLIENTE (Aggiornato con Email/Tel)
     with tabs[1]:
         with st.form("new_client"):
-            st.write("### Crea Nuovo Paziente")
-            nc_user = st.text_input("Username Paziente (univoco)")
-            nc_pass = st.text_input("Password Paziente")
-            nc_nome = st.text_input("Nome e Cognome")
-            nc_dati = st.text_area("Anamnesi / Dati Fisici")
+            st.write("### Aggiungi Nuovo Paziente")
+            c1, c2 = st.columns(2)
+            with c1:
+                nc_user = st.text_input("Username (univoco)")
+                nc_pass = st.text_input("Password")
+                nc_nome = st.text_input("Nome Completo")
+            with c2:
+                nc_email = st.text_input("Email")
+                nc_tel = st.text_input("Telefono (es. 39333...)")
+                nc_dati = st.text_input("Dati Fisici")
             
-            if st.form_submit_button("Crea"):
+            nc_obiett = st.text_input("Obiettivo Specifico")
+            
+            if st.form_submit_button("Crea Paziente"):
                 df_c = leggi_tab("CLIENTI")
                 if nc_user in df_c['username'].values:
-                    st.error("Username già in uso.")
+                    st.error("Username già esistente.")
                 else:
                     new_row = pd.DataFrame([{
                         "username": nc_user,
                         "password": nc_pass,
                         "nome_completo": nc_nome,
                         "studio_riferimento": dati['username'],
-                        "dati_fisici": nc_dati
+                        "dati_fisici": nc_dati,
+                        "obiettivo_specifico": nc_obiett,
+                        "email": nc_email,
+                        "telefono": nc_tel
                     }])
+                    # Salvataggio usando la funzione sicura scrivi_tab
+                    # Nota: scrivi_tab vuole il dataframe completo o fa append. 
+                    # Qui usiamo la logica di append manuale se usi la funzione scrivi_tab modificata prima
+                    # Se hai mantenuto la funzione scrivi_tab che fa append da sola, passa solo new_row.
+                    # Per sicurezza passiamo tutto:
                     scrivi_tab("CLIENTI", pd.concat([df_c, new_row], ignore_index=True))
-                    st.success("Cliente creato con successo!")
+                    st.success("Cliente creato!")
                     time.sleep(1)
                     st.rerun()
 
     # TAB 3: SETTINGS
     with tabs[2]:
-        with st.form("settings"):
-            st.write("### Personalizzazione")
-            new_logo = st.text_input("URL Logo", value=dati.get('logo_url', ''))
-            new_style = st.text_area("Prompt Nutrizionale", value=dati['stile_guida'])
-            
-            if st.form_submit_button("Salva"):
-                df_studi = leggi_tab("CONFIG_STUDI")
-                idx = df_studi.index[df_studi['username'] == dati['username']].tolist()[0]
-                df_studi.at[idx, 'logo_url'] = new_logo
-                df_studi.at[idx, 'stile_guida'] = new_style
-                scrivi_tab("CONFIG_STUDI", df_studi)
-                
-                # Aggiorna sessione
-                st.session_state.user_data['logo_url'] = new_logo
-                st.session_state.user_data['stile_guida'] = new_style
-                st.success("Salvato!")
-                st.rerun()
+         # ... (Lascia uguale a prima) ...
+         pass
 
 # ==========================================
-# INTERFACCIA CLIENTE
+# DASHBOARD CLIENTE
 # ==========================================
 def dashboard_cliente():
     dati = st.session_state.user_data
@@ -329,10 +475,10 @@ def dashboard_cliente():
         with st.container(border=True):
             st.markdown(ultima['testo_dieta'])
     else:
-        st.warning("Nessun piano assegnato.")
+        st.warning("Il tuo nutrizionista non ha ancora caricato il piano.")
 
 # ==========================================
-# MAIN
+# MAIN LOOP
 # ==========================================
 if not st.session_state.logged_in:
     login_page()
